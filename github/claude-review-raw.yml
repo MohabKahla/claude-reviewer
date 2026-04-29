@@ -1,0 +1,82 @@
+name: Claude Code Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, ready_for_review, reopened]
+
+concurrency:
+  group: claude-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    if: >
+      github.event.pull_request.draft == false &&
+      !contains(github.event.pull_request.title, 'skip-review') &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.actor != 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+
+      - uses: anthropics/claude-code-action@567fe954a4527e81f132d87d1bdbcc94f7737434
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          use_sticky_comment: true
+          classify_inline_comments: true
+          include_fix_links: true
+          prompt: |
+            Repository: ${{ github.repository }}
+            Pull Request: #${{ github.event.pull_request.number }}
+
+            ## Step 1: Gather context
+            - Run `gh pr view ${{ github.event.pull_request.number }}` to read the PR title, description, and any requirements stated by the author.
+            - Run `gh api repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/comments --paginate` to read all existing inline review comments.
+            - Run `gh pr view ${{ github.event.pull_request.number }} --comments` to read all existing PR conversation comments.
+            Use this context throughout the review. If prior review comments already cover an issue, do not post a duplicate — skip it.
+
+            ## Step 2: Run /review
+            Review the pull request for code quality, bugs, test gaps, and regressions.
+            Verify that everything described or promised in the PR description is actually implemented. If something is missing or incomplete, flag it explicitly.
+            Post inline comments for each finding.
+
+            ## Step 3: Run /security-review
+            Review the pull request for security issues: injection, auth bypass, secrets exposure, XSS, SSRF, path traversal, insecure deserialization, broken access control.
+            Post inline comments for each finding.
+
+            ## Step 4: Post summary
+            After both reviews, post a single top-level PR comment using `gh pr comment` with this exact format:
+
+            ```
+            ## Code Review
+
+            <Brief overall assessment>
+
+            | Findings | Critical |
+            |----------|----------|
+            | <total count> | <critical count> |
+
+            ## Security Review
+
+            <Brief security assessment>
+
+            | Findings | Critical |
+            |----------|----------|
+            | <total count> | <critical count> |
+
+            ### Missing from PR description
+            <List anything promised in the PR description but not implemented, or "None — all described changes are implemented.">
+
+            ---
+            _Automated by Claude Code_
+            ```
+          claude_args: >-
+            --allowedTools
+            "mcp__github_inline_comment__create_inline_comment,Bash(git diff*),Bash(git log*),Bash(git show*),Bash(gh pr diff*),Bash(gh pr view*),Read,Glob,Grep"
+            --max-turns 10

@@ -1,0 +1,450 @@
+image: node:20.20.2
+
+definitions:
+  caches:
+    claude-cli:
+      key:
+        files:
+          - bitbucket-pipelines.yml
+      path: /usr/local/lib/node_modules/@anthropic-ai
+
+pipelines:
+  pull-requests:
+    "**":
+      - step:
+          name: Claude Code Review
+          max-time: 20
+          caches:
+            - claude-cli
+          script:
+            - apt-get update && apt-get install -y -qq jq > /dev/null 2>&1
+            - npm install -g @anthropic-ai/claude-code@2.1.119
+            - export CLAUDE_CODE_SKIP_PROMPT_HISTORY=1
+            - export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
+            - export BB_API="https://api.bitbucket.org/2.0/repositories/${BITBUCKET_WORKSPACE}/${BITBUCKET_REPO_SLUG}/pullrequests/${BITBUCKET_PR_ID}"
+            - >-
+              export BB_AUTH="Authorization: Bearer ${BB_TOKEN}"
+
+            # Fetch PR data, check skip conditions, write sentinel if skipping
+            - |
+              rm -f /tmp/skip_review
+              PR_JSON=$(curl -sf -H "${BB_AUTH}" "${BB_API}" 2>/dev/null || true)
+              if [ -z "$PR_JSON" ] || ! echo "$PR_JSON" | jq empty 2>/dev/null; then
+                echo "Could not fetch PR data from API — skipping pre-checks"
+                echo "<pr-context>PR context unavailable.</pr-context>" > /tmp/pr_description.md
+              else
+                echo "$PR_JSON" > /tmp/pr_data.json
+
+                PR_STATE=$(jq -r '.draft // false' /tmp/pr_data.json)
+                if [ "$PR_STATE" = "true" ]; then
+                  echo "Skipping draft PR"
+                  touch /tmp/skip_review
+                fi
+
+                PR_TITLE=$(jq -r '.title // ""' /tmp/pr_data.json)
+                if echo "$PR_TITLE" | grep -q '\[skip-review\]'; then
+                  echo "Skipping review — [skip-review] in title"
+                  touch /tmp/skip_review
+                fi
+
+                PR_HEAD=$(jq -r '.source.commit.hash' /tmp/pr_data.json)
+                PR_HEAD_SHORT="${PR_HEAD:0:12}"
+                COMMIT_SHORT="${BITBUCKET_COMMIT:0:12}"
+                if [ "$PR_HEAD_SHORT" != "$COMMIT_SHORT" ]; then
+                  echo "Stale run — PR head is $PR_HEAD, this build is $BITBUCKET_COMMIT. Skipping."
+                  touch /tmp/skip_review
+                fi
+
+                if [ ! -f /tmp/skip_review ]; then
+                  # Sandbox PR description in XML tags so Claude treats it as data, not instructions
+                  jq -r '"<pr-context>\nPR Title: " + .title + "\n\nPR Description:\n" + (.description // "(none)") + "\n</pr-context>"' /tmp/pr_data.json > /tmp/pr_description.md
+                fi
+              fi
+
+            # Generate diff via destination commit (avoids shallow clone branch ref issues)
+            - |
+              if [ -f /tmp/skip_review ]; then echo "Skipped"; exit 0; fi
+              if [ -n "${BITBUCKET_PR_DESTINATION_COMMIT}" ]; then
+                echo "Diffing against destination commit: ${BITBUCKET_PR_DESTINATION_COMMIT}"
+                git diff "${BITBUCKET_PR_DESTINATION_COMMIT}...HEAD" > /tmp/pr_diff.txt
+              else
+                echo "BITBUCKET_PR_DESTINATION_COMMIT not set, falling back to branch ref"
+                git fetch origin "${BITBUCKET_PR_DESTINATION_BRANCH}" --depth=50 2>/dev/null || true
+                git diff "origin/${BITBUCKET_PR_DESTINATION_BRANCH}...HEAD" > /tmp/pr_diff.txt
+              fi
+              echo "Diff: $(wc -l < /tmp/pr_diff.txt) lines, $(wc -c < /tmp/pr_diff.txt) bytes"
+
+              # Build valid-lines map from diff for inline comment validation
+              awk '/^diff --git/ { sub("^b/", "", $NF); file=$NF }
+                   /^@@ / { s=$3; sub(/^\+/,"",s); split(s,a,","); start=a[1]+0; count=a[2]+0; if(count==0) count=1; for(i=start;i<start+count;i++) print file ":" i }' \
+                /tmp/pr_diff.txt > /tmp/valid_lines.txt
+              echo "Valid inline targets: $(wc -l < /tmp/valid_lines.txt) lines"
+
+            # Fetch prior bot comments for context
+            - |
+              if [ -f /tmp/skip_review ]; then echo "Skipped"; exit 0; fi
+              echo "" > /tmp/prior_comments.md
+              NEXT_URL="${BB_API}/comments?pagelen=100"
+              while [ -n "$NEXT_URL" ] && [ "$NEXT_URL" != "null" ]; do
+                PAGE=$(curl -sf -H "${BB_AUTH}" "$NEXT_URL" 2>/dev/null || true)
+                if [ -z "$PAGE" ] || ! echo "$PAGE" | jq empty 2>/dev/null; then break; fi
+                echo "$PAGE" | jq -r '
+                  .values[]
+                  | select(.content.raw | test("^\\[claude-(code|security)-review\\]"))
+                  | if .inline then
+                      "[" + (.content.raw | split("]")[0] | ltrimstr("[")) + "] " + .inline.path + ":" + (.inline.to | tostring) + " — " + (.content.raw | split("**: ")[1] // .content.raw)
+                    else
+                      "[summary] " + (.content.raw | split("\n")[0])
+                    end
+                ' >> /tmp/prior_comments.md 2>/dev/null || true
+                NEXT_URL=$(echo "$PAGE" | jq -r '.next // empty')
+              done
+              LINES=$(wc -l < /tmp/prior_comments.md | tr -d ' ')
+              echo "Prior bot comments collected: $LINES lines"
+
+            # ── Code Review ──
+            - |
+              if [ -f /tmp/skip_review ]; then echo "Skipped"; exit 0; fi
+              cat > /tmp/review_prompt.txt <<'PROMPT'
+              Review ONLY the following PR diff. Do not explore the broader codebase.
+              Verify that what was claimed in the PR description is actually implemented.
+
+              If prior review comments are provided below, consider them as context:
+              - Don't repeat the same findings unless they are still unresolved
+              - You may reference or build on prior feedback
+              - Focus on NEW or CHANGED issues
+
+              IMPORTANT: Output ONLY a valid JSON object with this exact structure, no markdown fences, no extra text:
+              {
+                "summary": "Brief overall assessment of the PR",
+                "comments": [
+                  {
+                    "path": "relative/file/path.ts",
+                    "line": 42,
+                    "severity": "critical|warning|suggestion|nitpick",
+                    "comment": "What the issue is and how to fix it"
+                  }
+                ]
+              }
+
+              Rules:
+              - "path" must be the file path as shown in the diff (e.g. src/app/page.tsx)
+              - "line" must be the NEW file line number from the diff (the + side), within a changed hunk
+              - If no issues found, return {"summary": "LGTM — no issues found.", "comments": []}
+              - Output ONLY the JSON, nothing else
+
+              <diff>
+              PROMPT
+              cat /tmp/pr_diff.txt >> /tmp/review_prompt.txt
+              echo '</diff>' >> /tmp/review_prompt.txt
+
+              if [ -s /tmp/prior_comments.md ]; then
+                echo '' >> /tmp/review_prompt.txt
+                echo '<prior-review-comments>' >> /tmp/review_prompt.txt
+                cat /tmp/prior_comments.md >> /tmp/review_prompt.txt
+                echo '</prior-review-comments>' >> /tmp/review_prompt.txt
+              fi
+
+              if [ -s /tmp/pr_description.md ]; then
+                echo '' >> /tmp/review_prompt.txt
+                cat /tmp/pr_description.md >> /tmp/review_prompt.txt
+              fi
+
+              claude --print \
+                --output-format text \
+                --allowedTools "Bash(git diff*),Bash(git log*),Bash(git show*),Read,Glob,Grep" \
+                --max-turns 10 \
+                < /tmp/review_prompt.txt \
+                > /tmp/code_review_output.json 2>/tmp/code_review_stderr.log || true
+
+              echo "Review stdout: $(wc -c < /tmp/code_review_output.json) bytes"
+              if [ -s /tmp/code_review_stderr.log ]; then
+                echo "Review stderr (first 500 chars): $(head -c 500 /tmp/code_review_stderr.log)"
+              fi
+
+            # Post code review inline comments + summary
+            - |
+              if [ -f /tmp/skip_review ]; then echo "Skipped"; exit 0; fi
+              REVIEW_RAW=$(cat /tmp/code_review_output.json 2>/dev/null)
+              MARKER="[claude-code-review]"
+              SHORT_SHA=$(echo "$BITBUCKET_COMMIT" | cut -c1-7)
+
+              # Extract JSON (handle possible markdown fences)
+              REVIEW_JSON=""
+              if echo "$REVIEW_RAW" | jq -e '.summary and .comments' >/dev/null 2>&1; then
+                REVIEW_JSON="$REVIEW_RAW"
+              else
+                EXTRACTED=$(echo "$REVIEW_RAW" | sed -n '/```json/,/```/{/```/d;p}' | jq -e '.summary and .comments' 2>/dev/null && echo "$REVIEW_RAW" | sed -n '/```json/,/```/{/```/d;p}')
+                if [ -n "$EXTRACTED" ]; then
+                  REVIEW_JSON="$EXTRACTED"
+                fi
+              fi
+
+              if [ -n "$REVIEW_JSON" ] && echo "$REVIEW_JSON" | jq -e '.summary and (.comments | type == "array")' >/dev/null 2>&1; then
+                SUMMARY=$(echo "$REVIEW_JSON" | jq -r '.summary')
+                COMMENT_COUNT=$(echo "$REVIEW_JSON" | jq '.comments | length')
+                echo "Review: $COMMENT_COUNT findings"
+
+                # Delete old comments (paginated)
+                NEXT_URL="${BB_API}/comments?pagelen=100"
+                while [ -n "$NEXT_URL" ] && [ "$NEXT_URL" != "null" ]; do
+                  PAGE=$(curl -sf -H "${BB_AUTH}" "$NEXT_URL" 2>/dev/null || true)
+                  if [ -z "$PAGE" ] || ! echo "$PAGE" | jq empty 2>/dev/null; then break; fi
+                  echo "$PAGE" | jq -r ".values[] | select(.content.raw | startswith(\"${MARKER}\")) | .id" | while read -r OLD_ID; do
+                    [ -n "$OLD_ID" ] && curl -sf -X DELETE "${BB_API}/comments/${OLD_ID}" -H "${BB_AUTH}" >/dev/null 2>&1 || true
+                  done
+                  NEXT_URL=$(echo "$PAGE" | jq -r '.next // empty')
+                done
+
+                # Post validated inline comments
+                POSTED=0
+                echo "$REVIEW_JSON" | jq -c '.comments[]' 2>/dev/null | while read -r ITEM; do
+                  FILE_PATH=$(echo "$ITEM" | jq -r '.path')
+                  LINE_NUM=$(echo "$ITEM" | jq -r '.line')
+                  SEVERITY=$(echo "$ITEM" | jq -r '.severity')
+                  COMMENT_TEXT=$(echo "$ITEM" | jq -r '.comment')
+
+                  # Validate line number is numeric
+                  if ! echo "$LINE_NUM" | grep -qE '^[0-9]+$'; then
+                    echo "Skipping invalid line number: ${FILE_PATH}:${LINE_NUM}"
+                    continue
+                  fi
+
+                  # Validate against diff hunks
+                  if ! grep -qF "${FILE_PATH}:${LINE_NUM}" /tmp/valid_lines.txt 2>/dev/null; then
+                    echo "Line not in diff hunks, posting as PR comment instead: ${FILE_PATH}:${LINE_NUM}"
+                    # Post as non-inline comment with file reference
+                    BODY="${MARKER} **${SEVERITY}** in \`${FILE_PATH}:${LINE_NUM}\`: ${COMMENT_TEXT}"
+                    PAYLOAD=$(jq -n --arg body "$BODY" '{"content":{"raw":$body}}')
+                    curl -sS -X POST "${BB_API}/comments" \
+                      -H "${BB_AUTH}" \
+                      -H "Content-Type: application/json" \
+                      -d "$PAYLOAD" >/dev/null 2>&1
+                    continue
+                  fi
+
+                  case "$SEVERITY" in
+                    critical)   ICON="🔴" ;;
+                    warning)    ICON="🟡" ;;
+                    suggestion) ICON="🔵" ;;
+                    nitpick)    ICON="⚪" ;;
+                    *)          ICON="❓" ;;
+                  esac
+
+                  INLINE_BODY="${MARKER} ${ICON} **${SEVERITY}**: ${COMMENT_TEXT}"
+                  PAYLOAD=$(jq -n \
+                    --arg body "$INLINE_BODY" \
+                    --arg path "$FILE_PATH" \
+                    --argjson line "$LINE_NUM" \
+                    '{"content":{"raw":$body},"inline":{"path":$path,"to":$line}}')
+
+                  echo "Inline: ${FILE_PATH}:${LINE_NUM} (${SEVERITY})"
+                  curl -sS -X POST "${BB_API}/comments" \
+                    -H "${BB_AUTH}" \
+                    -H "Content-Type: application/json" \
+                    -d "$PAYLOAD" >/dev/null 2>&1
+                done
+
+                # Summary comment
+                SUMMARY_BODY="${MARKER}
+              ## Code Review Summary
+
+              ${SUMMARY}
+
+              **${COMMENT_COUNT} finding(s) posted.**
+
+              ---
+              _Automated by Claude Code · ${SHORT_SHA}_"
+
+                PAYLOAD=$(jq -n --arg body "$SUMMARY_BODY" '{"content":{"raw":$body}}')
+                curl -sS -X POST "${BB_API}/comments" \
+                  -H "${BB_AUTH}" \
+                  -H "Content-Type: application/json" \
+                  -d "$PAYLOAD" >/dev/null 2>&1
+              else
+                echo "Could not parse review as structured JSON, posting raw"
+                BODY="${MARKER}
+              ## Code Review
+
+              ${REVIEW_RAW:-_Code review did not produce output. Check pipeline logs._}
+
+              ---
+              _Automated by Claude Code · ${SHORT_SHA}_"
+
+                PAYLOAD=$(jq -n --arg body "$BODY" '{"content":{"raw":$body}}')
+                curl -sS -X POST "${BB_API}/comments" \
+                  -H "${BB_AUTH}" \
+                  -H "Content-Type: application/json" \
+                  -d "$PAYLOAD" >/dev/null 2>&1
+              fi
+
+            # ── Security Review ──
+            - |
+              if [ -f /tmp/skip_review ]; then echo "Skipped"; exit 0; fi
+              cat > /tmp/security_prompt.txt <<'PROMPT'
+              Security review ONLY the following PR diff. Do not explore the broader codebase.
+              Focus only on security-relevant findings in the changed code.
+
+              If prior review comments are provided below, consider them as context:
+              - Don't repeat the same findings unless they are still unresolved
+              - You may reference or build on prior feedback
+              - Focus on NEW or CHANGED security issues
+
+              IMPORTANT: Output ONLY a valid JSON object with this exact structure, no markdown fences, no extra text:
+              {
+                "summary": "Brief security assessment",
+                "comments": [
+                  {
+                    "path": "relative/file/path.ts",
+                    "line": 42,
+                    "severity": "critical|warning|suggestion",
+                    "comment": "Security issue description and remediation"
+                  }
+                ]
+              }
+
+              Rules:
+              - "path" must be the file path as shown in the diff
+              - "line" must be the NEW file line number from the diff (the + side), within a changed hunk
+              - Only report genuine security concerns (injection, auth bypass, secrets, XSS, etc.)
+              - If no security issues found, return {"summary": "No security issues found.", "comments": []}
+              - Output ONLY the JSON, nothing else
+
+              <diff>
+              PROMPT
+              cat /tmp/pr_diff.txt >> /tmp/security_prompt.txt
+              echo '</diff>' >> /tmp/security_prompt.txt
+
+              if [ -s /tmp/prior_comments.md ]; then
+                echo '' >> /tmp/security_prompt.txt
+                echo '<prior-review-comments>' >> /tmp/security_prompt.txt
+                cat /tmp/prior_comments.md >> /tmp/security_prompt.txt
+                echo '</prior-review-comments>' >> /tmp/security_prompt.txt
+              fi
+
+              if [ -s /tmp/pr_description.md ]; then
+                echo '' >> /tmp/security_prompt.txt
+                cat /tmp/pr_description.md >> /tmp/security_prompt.txt
+              fi
+
+              claude --print \
+                --output-format text \
+                --allowedTools "Bash(git diff*),Bash(git log*),Bash(git show*),Read,Glob,Grep" \
+                --max-turns 10 \
+                < /tmp/security_prompt.txt \
+                > /tmp/security_review_output.json 2>/tmp/security_review_stderr.log || true
+
+              echo "Security review stdout: $(wc -c < /tmp/security_review_output.json) bytes"
+              if [ -s /tmp/security_review_stderr.log ]; then
+                echo "Security stderr (first 500 chars): $(head -c 500 /tmp/security_review_stderr.log)"
+              fi
+
+            # Post security review inline comments + summary
+            - |
+              if [ -f /tmp/skip_review ]; then echo "Skipped"; exit 0; fi
+              REVIEW_RAW=$(cat /tmp/security_review_output.json 2>/dev/null)
+              MARKER="[claude-security-review]"
+              SHORT_SHA=$(echo "$BITBUCKET_COMMIT" | cut -c1-7)
+
+              REVIEW_JSON=""
+              if echo "$REVIEW_RAW" | jq -e '.summary and .comments' >/dev/null 2>&1; then
+                REVIEW_JSON="$REVIEW_RAW"
+              else
+                EXTRACTED=$(echo "$REVIEW_RAW" | sed -n '/```json/,/```/{/```/d;p}' | jq -e '.summary and .comments' 2>/dev/null && echo "$REVIEW_RAW" | sed -n '/```json/,/```/{/```/d;p}')
+                if [ -n "$EXTRACTED" ]; then
+                  REVIEW_JSON="$EXTRACTED"
+                fi
+              fi
+
+              if [ -n "$REVIEW_JSON" ] && echo "$REVIEW_JSON" | jq -e '.summary and (.comments | type == "array")' >/dev/null 2>&1; then
+                SUMMARY=$(echo "$REVIEW_JSON" | jq -r '.summary')
+                COMMENT_COUNT=$(echo "$REVIEW_JSON" | jq '.comments | length')
+                echo "Security review: $COMMENT_COUNT findings"
+
+                # Delete old comments (paginated)
+                NEXT_URL="${BB_API}/comments?pagelen=100"
+                while [ -n "$NEXT_URL" ] && [ "$NEXT_URL" != "null" ]; do
+                  PAGE=$(curl -sf -H "${BB_AUTH}" "$NEXT_URL" 2>/dev/null || true)
+                  if [ -z "$PAGE" ] || ! echo "$PAGE" | jq empty 2>/dev/null; then break; fi
+                  echo "$PAGE" | jq -r ".values[] | select(.content.raw | startswith(\"${MARKER}\")) | .id" | while read -r OLD_ID; do
+                    [ -n "$OLD_ID" ] && curl -sf -X DELETE "${BB_API}/comments/${OLD_ID}" -H "${BB_AUTH}" >/dev/null 2>&1 || true
+                  done
+                  NEXT_URL=$(echo "$PAGE" | jq -r '.next // empty')
+                done
+
+                # Post validated inline comments
+                echo "$REVIEW_JSON" | jq -c '.comments[]' 2>/dev/null | while read -r ITEM; do
+                  FILE_PATH=$(echo "$ITEM" | jq -r '.path')
+                  LINE_NUM=$(echo "$ITEM" | jq -r '.line')
+                  SEVERITY=$(echo "$ITEM" | jq -r '.severity')
+                  COMMENT_TEXT=$(echo "$ITEM" | jq -r '.comment')
+
+                  if ! echo "$LINE_NUM" | grep -qE '^[0-9]+$'; then
+                    echo "Skipping invalid line number: ${FILE_PATH}:${LINE_NUM}"
+                    continue
+                  fi
+
+                  if ! grep -qF "${FILE_PATH}:${LINE_NUM}" /tmp/valid_lines.txt 2>/dev/null; then
+                    echo "Line not in diff hunks: ${FILE_PATH}:${LINE_NUM}, posting as PR comment"
+                    BODY="${MARKER} **${SEVERITY}** in \`${FILE_PATH}:${LINE_NUM}\`: ${COMMENT_TEXT}"
+                    PAYLOAD=$(jq -n --arg body "$BODY" '{"content":{"raw":$body}}')
+                    curl -sS -X POST "${BB_API}/comments" \
+                      -H "${BB_AUTH}" \
+                      -H "Content-Type: application/json" \
+                      -d "$PAYLOAD" >/dev/null 2>&1
+                    continue
+                  fi
+
+                  case "$SEVERITY" in
+                    critical)   ICON="🔴" ;;
+                    warning)    ICON="🟡" ;;
+                    suggestion) ICON="🔵" ;;
+                    *)          ICON="🟡" ;;
+                  esac
+
+                  INLINE_BODY="${MARKER} ${ICON} **${SEVERITY}**: ${COMMENT_TEXT}"
+                  PAYLOAD=$(jq -n \
+                    --arg body "$INLINE_BODY" \
+                    --arg path "$FILE_PATH" \
+                    --argjson line "$LINE_NUM" \
+                    '{"content":{"raw":$body},"inline":{"path":$path,"to":$line}}')
+
+                  echo "Inline: ${FILE_PATH}:${LINE_NUM} (${SEVERITY})"
+                  curl -sS -X POST "${BB_API}/comments" \
+                    -H "${BB_AUTH}" \
+                    -H "Content-Type: application/json" \
+                    -d "$PAYLOAD" >/dev/null 2>&1
+                done
+
+                # Summary comment
+                SUMMARY_BODY="${MARKER}
+              ## Security Review Summary
+
+              ${SUMMARY}
+
+              **${COMMENT_COUNT} finding(s) posted.**
+
+              ---
+              _Automated by Claude Code · ${SHORT_SHA}_"
+
+                PAYLOAD=$(jq -n --arg body "$SUMMARY_BODY" '{"content":{"raw":$body}}')
+                curl -sS -X POST "${BB_API}/comments" \
+                  -H "${BB_AUTH}" \
+                  -H "Content-Type: application/json" \
+                  -d "$PAYLOAD" >/dev/null 2>&1
+              else
+                echo "Could not parse security review as structured JSON, posting raw"
+                BODY="${MARKER}
+              ## Security Review
+
+              ${REVIEW_RAW:-_Security review did not produce output. Check pipeline logs._}
+
+              ---
+              _Automated by Claude Code · ${SHORT_SHA}_"
+
+                PAYLOAD=$(jq -n --arg body "$BODY" '{"content":{"raw":$body}}')
+                curl -sS -X POST "${BB_API}/comments" \
+                  -H "${BB_AUTH}" \
+                  -H "Content-Type: application/json" \
+                  -d "$PAYLOAD" >/dev/null 2>&1
+              fi
