@@ -20,10 +20,11 @@ jobs:
     permissions:
       contents: read
       pull-requests: write
+      issues: read
     steps:
       - uses: actions/checkout@v6
         with:
-          fetch-depth: 1
+          fetch-depth: 0
 
       - uses: anthropics/claude-code-action@567fe954a4527e81f132d87d1bdbcc94f7737434
         with:
@@ -39,15 +40,31 @@ jobs:
             - Run `gh pr view ${{ github.event.pull_request.number }}` to read the PR title, description, and any requirements stated by the author.
             - Run `gh api repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/comments --paginate` to read all existing inline review comments.
             - Run `gh pr view ${{ github.event.pull_request.number }} --comments` to read all existing PR conversation comments.
-            Use this context throughout the review. If prior review comments already cover an issue, do not post a duplicate — skip it.
+            - If the PR description contains `fixes #N`, `closes #N`, or `resolves #N`, run `gh issue view N` for each referenced issue to fetch its body. Use this as additional context to verify the code addresses the issue requirements.
+            Use this context throughout the review:
+            - If prior review comments from this bot already cover an issue, do NOT post a duplicate — skip it.
+            - Focus on surfacing only NEW findings. If a previous finding appears resolved by new commits, note that briefly in the summary instead.
 
             ## Step 2: Run /review
             Review the pull request for code quality, bugs, test gaps, and regressions.
             Verify that everything described or promised in the PR description is actually implemented. If something is missing or incomplete, flag it explicitly.
+            If linked issues were fetched in Step 1, verify the code actually addresses their requirements. Flag any gaps.
+
+            **Fast path**: If the PR only changes documentation files (.md), lockfiles (package-lock.json, yarn.lock, Gemfile.lock), or auto-generated files, perform a lighter review focused on correctness only — skip style and architecture analysis.
+
+            **Comment budget**: Post at most 10 inline comments total across both code review (Step 2) and security review (Step 3). Prioritize critical and warning severity findings. If more findings exist beyond 10, save them for the "Additional Findings" section in the summary.
+
+            **Suggestion blocks**: For simple, mechanical fixes (typos, missing null checks, obvious off-by-one errors), include a GitHub suggestion block in the inline comment body so the developer can one-click commit:
+            ```suggestion
+            corrected code here
+            ```
+            Do NOT use suggestion blocks for architectural changes, refactors, or multi-file fixes.
+
             Post inline comments for each finding.
 
             ## Step 3: Run /security-review
             Review the pull request for security issues: injection, auth bypass, secrets exposure, XSS, SSRF, path traversal, insecure deserialization, broken access control.
+            The same comment budget applies — at most 10 inline comments across both reviews combined. Prioritize critical findings.
             Post inline comments for each finding.
 
             ## Step 4: Post summary
@@ -70,13 +87,35 @@ jobs:
             |----------|----------|
             | <total count> | <critical count> |
 
+            ### Changes Walkthrough
+            <One-liner per changed file explaining what changed and why. Cap at 15 files. Skip generated files, lockfiles, and trivial test-only churn.>
+
+            | File | Change |
+            |------|--------|
+            | `path/to/file.ts` | <brief description> |
+
+            ### Risk Flags
+            <List any that apply, or "None detected.">
+            - 🔐 `touches-auth` — changes in auth/authorization code paths
+            - 🗄️ `db-migration` — migration files changed
+            - 🌐 `api-surface` — public API or endpoint changes
+            - 🧪 `no-tests-changed` — code changed but no test files modified
+            - ⚙️ `config-change` — CI/CD, env, or infrastructure config modified
+
             ### Missing from PR description
             <List anything promised in the PR description but not implemented, or "None — all described changes are implemented.">
+            <If linked issues were fetched, list any issue requirements not addressed by the code.>
+
+            ### Suggested Labels
+            <Comma-separated list of applicable labels: `has-tests`, `touches-auth`, `db-migration`, `config`, `docs-only`, `security-sensitive`. Omit if none apply.>
+
+            ### Additional Findings
+            <If the comment budget was exceeded, list remaining findings here grouped by severity. Otherwise omit this section.>
 
             ---
             _Automated by Claude Code_
             ```
           claude_args: >-
             --allowedTools
-            "mcp__github_inline_comment__create_inline_comment,Bash(git diff*),Bash(git log*),Bash(git show*),Bash(gh pr diff*),Bash(gh pr view*),Read,Glob,Grep"
+            "mcp__github_inline_comment__create_inline_comment,Bash(git diff*),Bash(git log*),Bash(git show*),Bash(gh pr diff*),Bash(gh pr view*),Bash(gh pr comment*),Bash(gh api*),Bash(gh issue view*),Read,Glob,Grep"
             --max-turns 10

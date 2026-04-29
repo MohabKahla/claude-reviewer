@@ -112,7 +112,11 @@ pipelines:
               If prior review comments are provided below, consider them as context:
               - Don't repeat the same findings unless they are still unresolved
               - You may reference or build on prior feedback
-              - Focus on NEW or CHANGED issues
+              - Focus on surfacing only NEW findings. If a previous finding appears resolved, note it in the summary.
+
+              **Fast path**: If the PR only changes documentation files (.md), lockfiles (package-lock.json, yarn.lock, Gemfile.lock), or auto-generated files, perform a lighter review focused on correctness only — skip style and architecture analysis.
+
+              **Comment budget**: Include at most 10 comments. Prioritize critical and warning severity. If more findings exist, list them briefly in the "additional_findings" field.
 
               IMPORTANT: Output ONLY a valid JSON object with this exact structure, no markdown fences, no extra text:
               {
@@ -124,13 +128,25 @@ pipelines:
                     "severity": "critical|warning|suggestion|nitpick",
                     "comment": "What the issue is and how to fix it"
                   }
-                ]
+                ],
+                "walkthrough": [
+                  {
+                    "file": "relative/file/path.ts",
+                    "change": "Brief one-liner explaining what changed"
+                  }
+                ],
+                "risk_flags": ["touches-auth", "db-migration", "api-surface", "no-tests-changed", "config-change"],
+                "suggested_labels": ["has-tests", "touches-auth", "db-migration", "config", "docs-only", "security-sensitive"],
+                "additional_findings": "Any findings beyond the 10-comment budget, grouped by severity. Empty string if none."
               }
 
               Rules:
               - "path" must be the file path as shown in the diff (e.g. src/app/page.tsx)
               - "line" must be the NEW file line number from the diff (the + side), within a changed hunk
-              - If no issues found, return {"summary": "LGTM — no issues found.", "comments": []}
+              - "walkthrough" — one entry per meaningful changed file, cap at 15. Skip generated files, lockfiles, trivial test churn.
+              - "risk_flags" — only include flags that apply. Use empty array if none.
+              - "suggested_labels" — only include labels that apply. Use empty array if none.
+              - If no issues found, return {"summary": "LGTM — no issues found.", "comments": [], "walkthrough": [], "risk_flags": [], "suggested_labels": [], "additional_findings": ""}
               - Output ONLY the JSON, nothing else
 
               <diff>
@@ -245,6 +261,46 @@ pipelines:
                     -d "$PAYLOAD" >/dev/null 2>&1
                 done
 
+                # Build walkthrough section
+                WALKTHROUGH=""
+                WT_COUNT=$(echo "$REVIEW_JSON" | jq '.walkthrough | length' 2>/dev/null || echo "0")
+                if [ "$WT_COUNT" -gt 0 ]; then
+                  WALKTHROUGH="
+              ### Changes Walkthrough
+
+              | File | Change |
+              |------|--------|"
+                  WALKTHROUGH="${WALKTHROUGH}
+              $(echo "$REVIEW_JSON" | jq -r '.walkthrough[] | "| `" + .file + "` | " + .change + " |"' 2>/dev/null)"
+                fi
+
+                # Build risk flags section
+                RISK_FLAGS=""
+                RF_COUNT=$(echo "$REVIEW_JSON" | jq '.risk_flags | length' 2>/dev/null || echo "0")
+                if [ "$RF_COUNT" -gt 0 ]; then
+                  RISK_FLAGS="
+              ### Risk Flags
+              $(echo "$REVIEW_JSON" | jq -r '.risk_flags[] | "- `" + . + "`"' 2>/dev/null)"
+                fi
+
+                # Build suggested labels section
+                LABELS=""
+                LBL_COUNT=$(echo "$REVIEW_JSON" | jq '.suggested_labels | length' 2>/dev/null || echo "0")
+                if [ "$LBL_COUNT" -gt 0 ]; then
+                  LABELS="
+              ### Suggested Labels
+              $(echo "$REVIEW_JSON" | jq -r '.suggested_labels | join(", ")' 2>/dev/null)"
+                fi
+
+                # Build additional findings section
+                ADDL=""
+                ADDL_TEXT=$(echo "$REVIEW_JSON" | jq -r '.additional_findings // ""' 2>/dev/null)
+                if [ -n "$ADDL_TEXT" ] && [ "$ADDL_TEXT" != "" ]; then
+                  ADDL="
+              ### Additional Findings
+              ${ADDL_TEXT}"
+                fi
+
                 # Summary comment
                 SUMMARY_BODY="${MARKER}
               ## Code Review Summary
@@ -252,6 +308,10 @@ pipelines:
               ${SUMMARY}
 
               **${COMMENT_COUNT} finding(s) posted.**
+              ${WALKTHROUGH}
+              ${RISK_FLAGS}
+              ${LABELS}
+              ${ADDL}
 
               ---
               _Automated by Claude Code · ${SHORT_SHA}_"
@@ -288,7 +348,9 @@ pipelines:
               If prior review comments are provided below, consider them as context:
               - Don't repeat the same findings unless they are still unresolved
               - You may reference or build on prior feedback
-              - Focus on NEW or CHANGED security issues
+              - Focus on surfacing only NEW security issues. If a previous finding appears resolved, note it in the summary.
+
+              **Comment budget**: Include at most 10 comments. Prioritize critical findings.
 
               IMPORTANT: Output ONLY a valid JSON object with this exact structure, no markdown fences, no extra text:
               {

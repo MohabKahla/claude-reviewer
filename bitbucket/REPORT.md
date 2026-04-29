@@ -1,8 +1,10 @@
-# Automated AI Code Review — Executive Report
+# Automated AI Code Review — Executive Report (Bitbucket)
 
 ## What is this?
 
 An automated code review system that uses AI to review every pull request before it reaches a human reviewer. It catches bugs, security vulnerabilities, and missing requirements — then posts its findings directly on the pull request for the developer to address.
+
+This runs as a Bitbucket Pipeline step, fully integrated into the existing CI/CD workflow.
 
 ## Why are we doing this?
 
@@ -18,54 +20,60 @@ When a developer submits code changes:
 2. **Reviews code quality** — looks for bugs, missing tests, logic errors, regressions
 3. **Reviews security** — scans for common vulnerabilities (data leaks, injection attacks, authentication bypasses, exposed passwords)
 4. **Checks completeness** — verifies that everything promised in the PR description was actually implemented
-5. **Validates linked issues** — if the developer says the code fixes a specific issue or ticket, the AI reads that issue and checks whether the code actually addresses it
-6. **Avoids noise** — reads existing review comments and does not repeat what was already said. Limits inline comments to prevent information overload.
-7. **Posts results** — leaves specific comments on problem lines and a summary on the pull request
+5. **Avoids noise** — reads existing review comments and does not repeat what was already said. Limits inline comments to prevent information overload.
+6. **Posts results** — leaves specific comments on problem lines and a summary on the pull request
 
 ## What does the output look like?
 
-Developers see a single summary comment on every PR that includes:
+Developers see two summary comments on every PR — one for code review, one for security:
 
-- **Code review assessment** — overall quality verdict with a count of findings and critical issues
-- **Security review assessment** — security verdict with its own finding counts
+- **Overall assessment** — a plain-language verdict on the quality and safety of the changes
+- **Finding counts** — how many issues were found, broken down by severity
 - **Changes walkthrough** — a quick-scan table showing what each file changed and why, so reviewers can orient themselves before diving into the code
 - **Risk flags** — automatic flags like "this PR touches authentication code" or "no tests were added for these code changes" — highlights areas that need extra human attention
-- **Missing items** — anything the developer described in the PR but didn't actually implement
-- **Suggested labels** — recommended tags for the PR (e.g. "has-tests", "touches-auth", "database") to help with organization
-- **One-click fixes** — for simple mechanical issues like typos, the AI provides a fix that the developer can apply with a single click directly from the PR page
+- **Suggested labels** — recommended tags for the PR to help with organization and routing
 
-The summary updates automatically when the developer pushes new code — no clutter from old reviews. On subsequent pushes, the AI focuses on what's new rather than repeating previous feedback.
+In addition, developers get **inline comments on specific lines** where issues were found, tagged by severity (critical, warning, suggestion, nitpick).
+
+On subsequent pushes, old review comments are automatically replaced with fresh ones — no stale feedback cluttering the PR.
 
 ## What it does NOT do
 
 - It does not approve or merge pull requests
 - It does not replace human reviewers — it assists them
-- It does not modify any code (unless the developer explicitly clicks a suggested fix)
+- It does not modify any code
 - It does not have access to production systems, databases, or customer data
-- It does not review draft pull requests or dependency bot updates
+- It does not review draft pull requests
 
 ## Cost
 
 - **Per review**: One AI session per pull request update, typically taking 2-10 minutes
-- **Smart cancellation**: If a developer pushes again before a review finishes, the old review is automatically cancelled — no wasted spend
-- **Skip option**: Developers can skip reviews for trivial changes by adding `skip-review` to the PR title
+- **Stale run detection**: If a developer pushes again before a review finishes, the older pipeline run detects it's stale and exits early — no wasted spend
+- **Skip option**: Developers can skip reviews for trivial changes by adding `[skip-review]` to the PR title
 - **Lighter reviews**: Documentation-only changes and lockfile updates get a faster, lighter review — no unnecessary analysis
 
 ## Security
 
-- The AI has **read-only access** to the code being reviewed and the ability to post comments
+- The AI has **read-only access** to the code diff and the ability to post comments
 - It **cannot** push code, approve PRs, or access anything outside the repository
-- Fork pull requests are **automatically skipped** to prevent external code from triggering reviews
-- The action is **pinned to a specific verified version** to prevent supply chain attacks
-- Authentication uses a dedicated token stored in encrypted repository secrets
+- The Claude CLI version is **pinned** to prevent unexpected behavior from upgrades
+- Authentication tokens are stored as **encrypted pipeline variables** — not in the repository code
+- The PR description is sandboxed to prevent it from being interpreted as instructions to the AI
 
 ## Platform
 
-GitHub Actions — uses the official Anthropic GitHub Action.
+Bitbucket Cloud — runs as a custom Bitbucket Pipeline step. No official Anthropic Bitbucket integration exists, so this is a purpose-built implementation.
 
 ## Setup required
 
-One secret (`CLAUDE_CODE_OAUTH_TOKEN`) added to repository settings. No infrastructure, no servers, no maintenance. Runs entirely within the existing CI/CD pipeline.
+Two pipeline variables added to repository settings:
+
+| Variable | Purpose |
+|----------|---------|
+| `CLAUDE_CODE_OAUTH_TOKEN` | Authenticates with the Claude Code API |
+| `BB_TOKEN` | Authenticates with the Bitbucket API to post review comments |
+
+No infrastructure, no servers, no maintenance. Runs entirely within Bitbucket Pipelines.
 
 ## Expected benefits
 
@@ -75,7 +83,7 @@ One secret (`CLAUDE_CODE_OAUTH_TOKEN`) added to repository settings. No infrastr
 - Human reviewers freed to focus on higher-value feedback (architecture, design, approach)
 - Reduced risk of shipping bugs or security issues that were missed in review
 - Risk flags help reviewers quickly identify which PRs need careful attention vs. a quick glance
-- Issue validation catches cases where code was submitted as a "fix" but doesn't actually address the original problem
+- Changes walkthrough gives reviewers a fast orientation before they start reading code
 
 ## Limitations
 
